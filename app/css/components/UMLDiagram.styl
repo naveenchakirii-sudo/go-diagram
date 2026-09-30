@@ -7,15 +7,44 @@ fileMinWidth = 160px
 addStructButtonSize = 30px
 
 .UMLDiagram
+  width 100%
+  height 100%
   overflow hidden
+  position relative
+  cursor grab
+  touch-action none
+  user-select none
+  input
+    user-select text
+  .diagram
+    position absolute
+    top 0
+    left 0
+    transform-origin 0 0
   &.dragging
     cursor move
   .packages, .edges
     position absolute
   .packages
+    z-index 1
+    display flex
+    align-items flex-start
+    width max-content
+    .package, .file
+      display flex
+      flex-wrap wrap
+      align-items flex-start
+      align-content flex-start
+    .package
+      max-width 1400px
+    .file
+      max-width 1000px
+      padding-right 50px
+    .Struct
+      position relative
+      z-index 2
     .package, .file, .Struct
       margin umlPadding
-      display inline-block
       box-shadow 0px 0px 10px rgba(0, 0, 0, .3)
     .package, .file
       position relative
@@ -48,12 +77,24 @@ addStructButtonSize = 30px
         position absolute
         top umlBorderRadius
         right umlBorderRadius
-        width: addStructButtonSize
-        height: addStructButtonSize
+        width addStructButtonSize
+        height addStructButtonSize
     .selected
       box-shadow 0 0 10px rgba(colorUMLSelectedShadow, 0.2)
+  .empty
+    margin 0 umlPadding umlPadding
+    color rgba(white, 0.4)
+    font-size 12px
+    font-style italic
   .edges
+    z-index 0
+    top 0
+    left 0
     pointer-events none
-    .edge
-      color blue
+    overflow visible
+    .edgeline
+      fill none
+      stroke white
+      stroke-opacity 0.55
+      stroke-width 2
 

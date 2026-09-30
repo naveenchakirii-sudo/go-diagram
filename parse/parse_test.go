@@ -252,3 +252,32 @@ func TestWriteBackRejectsInvalidInput(t *testing.T) {
 		t.Error("expected error for unknown package")
 	}
 }
+
+func TestWriteBackKeepsGenericsAndTags(t *testing.T) {
+	src := "package demo\n\nconst doc = `\ntype NotADecl struct{}\n`\n\ntype User struct {\n\tID   int    `json:\"id\"`\n\tName string `json:\"name,omitempty\"`\n}\n\ntype Pair[K comparable, V any] struct {\n\tKey K\n\tVal V\n}\n"
+	dir := writeTemp(t, map[string]string{"demo.go": src})
+	cs, pkgs, err := GetStructsDirName(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cs.Packages[0].Files[0].Structs[1].TypeParams; got != "[K comparable, V any]" {
+		t.Fatalf("type params = %q", got)
+	}
+	cs.Packages[0].Files[0].Structs[0].Fields[1].Name = "FullName"
+	if err := WriteClientPackages(dir, pkgs, cs.Packages); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := os.ReadFile(filepath.Join(dir, "demo.go"))
+	got := string(out)
+	if !strings.Contains(got, "`\ntype NotADecl struct{}\n`") {
+		t.Errorf("raw string literal was modified:\n%s", got)
+	}
+	if !strings.Contains(got, "}\n\ntype Pair") {
+		t.Errorf("expected a blank line between declarations:\n%s", got)
+	}
+	for _, want := range []string{"`json:\"id\"`", "FullName string `json:\"name,omitempty\"`", "type Pair[K comparable, V any] struct"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q after write-back:\n%s", want, got)
+		}
+	}
+}

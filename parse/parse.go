@@ -40,14 +40,18 @@ type File struct {
 }
 
 type Struct struct {
-	Name   string  `json:"name"`
-	Fields []Field `json:"fields"`
+	Name string `json:"name"`
+	// TypeParams holds generic parameters as source, e.g. "[T any]".
+	TypeParams string  `json:"typeParams,omitempty"`
+	Fields     []Field `json:"fields"`
 }
 
 type Field struct {
 	Name     string `json:"name"`
 	Type     Type   `json:"type"`
 	Embedded bool   `json:"embedded,omitempty"`
+	// Tag is the raw struct tag including backquotes, e.g. `json:"id"`.
+	Tag string `json:"tag,omitempty"`
 }
 
 type Node struct {
@@ -105,13 +109,17 @@ func GetStructsFile(fset *token.FileSet, f *ast.File, fname string, packageName 
 				for _, n := range field.Names {
 					fieldNames = append(fieldNames, n.Name)
 				}
+				tag := ""
+				if field.Tag != nil {
+					tag = field.Tag.Value
+				}
 				embedded := len(fieldNames) == 0
 				if embedded {
 					fieldNames = append(fieldNames, embeddedName(field.Type))
 				}
 
 				for _, name := range fieldNames {
-					fields = append(fields, Field{Name: name, Type: fieldType, Embedded: embedded})
+					fields = append(fields, Field{Name: name, Type: fieldType, Embedded: embedded, Tag: tag})
 					for _, toNode := range toNodes {
 						to := *toNode
 						edges = append(edges, Edge{
@@ -121,10 +129,37 @@ func GetStructsFile(fset *token.FileSet, f *ast.File, fname string, packageName 
 					}
 				}
 			}
-			structs = append(structs, Struct{Name: ts.Name.Name, Fields: fields})
+			structs = append(structs, Struct{Name: ts.Name.Name, TypeParams: typeParamsString(fset, ts.TypeParams), Fields: fields})
 		}
 	}
 	return File{Name: fname, Structs: structs}, edges
+}
+
+func typeParamsString(fset *token.FileSet, fl *ast.FieldList) string {
+	if fl == nil || len(fl.List) == 0 {
+		return ""
+	}
+	parts := []string{}
+	for _, f := range fl.List {
+		names := []string{}
+		for _, n := range f.Names {
+			names = append(names, n.Name)
+		}
+		parts = append(parts, strings.Join(names, ", ")+" "+exprString(fset, f.Type))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+// parseTypeParams turns "[K comparable, V any]" back into an AST field list.
+func parseTypeParams(src string) (*ast.FieldList, error) {
+	if src == "" {
+		return nil, nil
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), "", "package p\ntype _T"+src+" struct{}\n", 0)
+	if err != nil {
+		return nil, fmt.Errorf("invalid type parameters %q: %w", src, err)
+	}
+	return f.Decls[0].(*ast.GenDecl).Specs[0].(*ast.TypeSpec).TypeParams, nil
 }
 
 func embeddedName(e ast.Expr) string {
@@ -363,7 +398,35 @@ func writeFileAST(path string, f *ast.File) error {
 	if err := format.Node(&buf, token.NewFileSet(), f); err != nil {
 		return err
 	}
-	return os.WriteFile(path, buf.Bytes(), 0644)
+	out, err := format.Source(spaceTopLevelDecls(buf.Bytes()))
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0644)
+}
+
+// spaceTopLevelDecls restores the blank line gofmt-style code has between
+// top-level declarations; printing a rebuilt AST without positions drops it.
+// Declaration starts come from re-parsing, so string literals are never touched.
+func spaceTopLevelDecls(src []byte) []byte {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		return src
+	}
+	starts := map[int]bool{}
+	for _, d := range f.Decls {
+		starts[fset.Position(d.Pos()).Line] = true
+	}
+	lines := strings.Split(string(src), "\n")
+	out := make([]string, 0, len(lines)+len(starts))
+	for i, line := range lines {
+		if starts[i+1] && i > 0 && strings.TrimSpace(lines[i-1]) != "" {
+			out = append(out, "")
+		}
+		out = append(out, line)
+	}
+	return []byte(strings.Join(out, "\n"))
 }
 
 // clientFileToAST replaces the struct declarations in f with the client's
@@ -442,16 +505,27 @@ func clientFileToDecls(clientfile File) ([]ast.Decl, error) {
 				return nil, fmt.Errorf("invalid type %q for %s.%s: %w", clientfield.Type.Literal, clientstruct.Name, clientfield.Name, err)
 			}
 			field := &ast.Field{Type: parsedtype}
+			if clientfield.Tag != "" {
+				if !strings.HasPrefix(clientfield.Tag, "`") && !strings.HasPrefix(clientfield.Tag, "\"") {
+					return nil, fmt.Errorf("invalid tag %q for %s.%s", clientfield.Tag, clientstruct.Name, clientfield.Name)
+				}
+				field.Tag = &ast.BasicLit{Kind: token.STRING, Value: clientfield.Tag}
+			}
 			if !clientfield.Embedded {
 				field.Names = []*ast.Ident{ast.NewIdent(clientfield.Name)}
 			}
 			fieldList = append(fieldList, field)
 		}
+		typeParams, err := parseTypeParams(clientstruct.TypeParams)
+		if err != nil {
+			return nil, err
+		}
 		decls = append(decls, &ast.GenDecl{
 			Tok: token.TYPE,
 			Specs: []ast.Spec{&ast.TypeSpec{
-				Name: ast.NewIdent(clientstruct.Name),
-				Type: &ast.StructType{Fields: &ast.FieldList{List: fieldList}},
+				Name:       ast.NewIdent(clientstruct.Name),
+				TypeParams: typeParams,
+				Type:       &ast.StructType{Fields: &ast.FieldList{List: fieldList}},
 			}},
 		})
 	}

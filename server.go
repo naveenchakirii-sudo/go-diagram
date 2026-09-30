@@ -175,6 +175,11 @@ func (s *session) run() {
 			if s.send(clientError{Error: err.Error()}) != nil {
 				return
 			}
+			// The edit was rejected, so resend the real state to undo it in the UI.
+			lastPrint = ""
+			if !push() {
+				return
+			}
 		case <-fileTicker.C:
 			if !push() {
 				return

@@ -1,6 +1,2 @@
-node_modules
-.DS_Store
-js/bundle.js
-js/bundle.min.js
-build
-npm-debug.log
+node_modules/
+dist/
