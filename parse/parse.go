@@ -1,25 +1,26 @@
+// Package parse converts Go source into a JSON-friendly description of its
+// structs and the references between them, and writes edited structs back.
 package parse
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
 	"go/types"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"reflect"
+	"sort"
 	"strings"
-	//"golang.org/x/tools/go/ast/astutil"
-	"bytes"
 )
 
-// If the type represents a struct (not an alias or primitive), it will have a package and file name identifier
+// Type describes a field's type: the source literal plus the named
+// (non-primitive) types it refers to.
 type Type struct {
-	Literal string `json:"literal"`
-	// Package string `json:"package"`
+	Literal string   `json:"literal"`
 	Structs []string `json:"structs"`
 }
 
@@ -41,18 +42,12 @@ type File struct {
 type Struct struct {
 	Name   string  `json:"name"`
 	Fields []Field `json:"fields"`
-	//Methods []Method `json:"methods"`
 }
 
-// TODO multiple names per field
 type Field struct {
-	Name string `json:"name"`
-	Type Type   `json:"type"`
-}
-
-type Method struct {
-	Name       string `json:"name"`
-	ReturnType []Type `json:"returnType"`
+	Name     string `json:"name"`
+	Type     Type   `json:"type"`
+	Embedded bool   `json:"embedded,omitempty"`
 }
 
 type Node struct {
@@ -67,125 +62,168 @@ type Edge struct {
 	From *Node `json:"from"`
 }
 
+// skipDirs are directory names never scanned for Go source.
+var skipDirs = map[string]bool{
+	"app": true, "node_modules": true, "vendor": true, "testdata": true,
+}
+
+func exprString(fset *token.FileSet, e ast.Expr) string {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, e); err != nil {
+		return fmt.Sprintf("%T", e)
+	}
+	return buf.String()
+}
+
+// GetStructsFile extracts the structs declared in one file and the edges
+// from each field to the named types it references.
 func GetStructsFile(fset *token.FileSet, f *ast.File, fname string, packageName string) (File, []Edge) {
 	structs := []Struct{}
 	edges := []Edge{}
-	//ast.Print(fset, f)
-	// For all declarations
 	for _, d := range f.Decls {
-		if g, ok := d.(*ast.GenDecl); ok && g.Tok == token.TYPE {
-			// For all type declarations
-			for _, s := range g.Specs {
-				if ts, ok := s.(*ast.TypeSpec); ok {
-					if st, ok := ts.Type.(*ast.StructType); ok {
-						fields := []Field{}
-						for _, field := range st.Fields.List {
-							// TODO: why can a field have multiple names?
-							for _, name := range field.Names {
-								// TODO: can the type be an expression?
-								//fmt.Println(astutil.NodeDescription(field.Type))
-								var buf bytes.Buffer
-								if err := format.Node(&buf, fset, field.Type); err != nil {
-									panic(err)
-								}
-								// stpackage, stname = GetType(field.Type)
-								// fieldtype := Type{Literal: string(buf.Bytes()), Package: stpackage, Struct: stname}
-								stname, toNodes := GetTypes(field.Type, packageName)
-								fieldtype := Type{Literal: string(buf.Bytes()), Structs: stname}
-								fi := Field{Name: name.Name, Type: fieldtype}
-								fields = append(fields, fi)
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.TYPE {
+			continue
+		}
+		for _, s := range g.Specs {
+			ts, ok := s.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			fields := []Field{}
+			for _, field := range st.Fields.List {
+				literal := exprString(fset, field.Type)
+				names, toNodes := GetTypes(field.Type, packageName)
+				fieldType := Type{Literal: literal, Structs: names}
 
-								// Add edges
-								for _, toNode := range toNodes {
-									edges = append(edges, Edge{From: &Node{FieldTypeName: name.Name, StructName: ts.Name.Name, FileName: fname, PackageName: packageName}, To: toNode})
-								}
-							}
-						}
-						structs = append(structs, Struct{Name: ts.Name.Name, Fields: fields})
+				// Embedded fields have no names; use the type name, as Go does.
+				fieldNames := []string{}
+				for _, n := range field.Names {
+					fieldNames = append(fieldNames, n.Name)
+				}
+				embedded := len(fieldNames) == 0
+				if embedded {
+					fieldNames = append(fieldNames, embeddedName(field.Type))
+				}
+
+				for _, name := range fieldNames {
+					fields = append(fields, Field{Name: name, Type: fieldType, Embedded: embedded})
+					for _, toNode := range toNodes {
+						to := *toNode
+						edges = append(edges, Edge{
+							From: &Node{FieldTypeName: name, StructName: ts.Name.Name, FileName: fname, PackageName: packageName},
+							To:   &to,
+						})
 					}
 				}
 			}
+			structs = append(structs, Struct{Name: ts.Name.Name, Fields: fields})
 		}
 	}
 	return File{Name: fname, Structs: structs}, edges
 }
 
-// TODO: don't deeply nest
-// https://golang.org/ref/spec#Struct_types
-// func GetStructsFileName(filename string) File {
-// 	fset := token.NewFileSet()
+func embeddedName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return embeddedName(t.X)
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	case *ast.IndexExpr:
+		return embeddedName(t.X)
+	case *ast.IndexListExpr:
+		return embeddedName(t.X)
+	}
+	return "_"
+}
 
-// 	f, err := parser.ParseFile(fset, filename, nil, 0)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	return GetStructsFile(fset, f, filename)
-// }
-
-// TODO use a map instead of this craziness
-func GetFileName(toNode *Node, pkgs []Package) string {
+func fileIndex(pkgs []Package) map[string]string {
+	idx := map[string]string{}
 	for _, pkg := range pkgs {
-		if pkg.Name == toNode.PackageName {
-			for _, file := range pkg.Files {
-				for _, st := range file.Structs {
-					if st.Name == toNode.StructName {
-						return file.Name
-					}
-				}
+		for _, file := range pkg.Files {
+			for _, st := range file.Structs {
+				idx[pkg.Name+"."+st.Name] = file.Name
 			}
 		}
 	}
-	// Because we don't index types like funcs yet, those won't be found
-	// and we can't find the filename. Just leave it as is for now. TODO
-	fmt.Println("Matching file not found for struct", toNode.StructName, "(probably a library package)")
-	return ""
+	return idx
 }
 
-func getPackagesEdgesDirName(path string, fset *token.FileSet) ([]Package, []Edge, map[string]*ast.Package) {
+func getPackagesEdgesDirName(path string, fset *token.FileSet) ([]Package, []Edge, map[string]*ast.Package, error) {
 	var packages []Package
 	var edges []Edge
-	packagemap, err := parser.ParseDir(fset, path, nil, 0)
+	//nolint:staticcheck // ParseDir is deprecated but still the simplest fit here.
+	packagemap, err := parser.ParseDir(fset, path, nil, parser.ParseComments)
 	if err != nil {
-		panic(err)
+		return nil, nil, nil, err
 	}
-	for packagename, packageval := range packagemap {
-		// TODO ignore main for now because of conflicts
-		// Assumes that packagenames are unique
-		if packagename != "main" {
-			files := []File{}
-			for fname, f := range packageval.Files {
-				newfile, newedges := GetStructsFile(fset, f, fname, packagename)
-				files = append(files, newfile)
-				edges = append(edges, newedges...)
-			}
-			packages = append(packages, Package{Name: packagename, Files: files})
+	names := make([]string, 0, len(packagemap))
+	for name := range packagemap {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, packagename := range names {
+		// Packages are keyed by name, so every "main" package would collide.
+		if packagename == "main" {
+			continue
 		}
+		packageval := packagemap[packagename]
+		fnames := make([]string, 0, len(packageval.Files))
+		for fname := range packageval.Files {
+			fnames = append(fnames, fname)
+		}
+		sort.Strings(fnames)
+		files := []File{}
+		for _, fname := range fnames {
+			newfile, newedges := GetStructsFile(fset, packageval.Files[fname], fname, packagename)
+			files = append(files, newfile)
+			edges = append(edges, newedges...)
+		}
+		packages = append(packages, Package{Name: packagename, Files: files})
 	}
-	return packages, edges, packagemap
+	return packages, edges, packagemap, nil
 }
 
-func GetStructsDirName(path string) (*ClientStruct, map[string]*ast.Package) {
-	directories := []string{}
+// GetStructsDirName parses every Go package under path.
+func GetStructsDirName(path string) (*ClientStruct, map[string]*ast.Package, error) {
 	packages := []Package{}
 	edges := []Edge{}
 	pkgmap := map[string]*ast.Package{}
 	fset := token.NewFileSet()
 
-	directories = []string{path}
-	// Get all the directories
-	filepath.Walk(path, func(path string, f os.FileInfo, err error) error {
-		if f.IsDir() {
-			if !strings.Contains(path, "app") {
-				directories = append(directories, path)
-			}
+	directories := []string{}
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		if !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if p != path && (skipDirs[name] || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")) {
+			return filepath.SkipDir
+		}
+		directories = append(directories, p)
 		return nil
 	})
-	fmt.Printf("Process %d directories\n", len(directories))
+	if err != nil {
+		return nil, nil, err
+	}
 
+	var parseErrs []string
 	for _, directory := range directories {
-		newpackages, newedges, newpkgmap := getPackagesEdgesDirName(directory, fset)
-		// Merge the packages, edges, and pkgmap from this directory with our other results
+		newpackages, newedges, newpkgmap, err := getPackagesEdgesDirName(directory, fset)
+		if err != nil {
+			// Keep going: one broken file shouldn't hide the rest of the project.
+			parseErrs = append(parseErrs, err.Error())
+			continue
+		}
 		packages = append(packages, newpackages...)
 		edges = append(edges, newedges...)
 		for k, v := range newpkgmap {
@@ -193,16 +231,22 @@ func GetStructsDirName(path string) (*ClientStruct, map[string]*ast.Package) {
 		}
 	}
 
-	// The To Nodes in Edges are currently missing filename because that's unknown when we are going through the AST
-	// Here we fill in what the filename is
+	// Edge targets only know their package while walking the AST; fill in
+	// the file now. Targets outside the project (library types) are dropped.
+	idx := fileIndex(packages)
 	validedges := []Edge{}
 	for _, edge := range edges {
-		if name := GetFileName(edge.To, packages); name != "" {
+		if name, ok := idx[edge.To.PackageName+"."+edge.To.StructName]; ok {
 			edge.To.FileName = name
 			validedges = append(validedges, edge)
 		}
 	}
-	return &ClientStruct{Packages: packages, Edges: validedges}, pkgmap
+
+	var outErr error
+	if len(parseErrs) > 0 {
+		outErr = fmt.Errorf("some files could not be parsed: %s", strings.Join(parseErrs, "; "))
+	}
+	return &ClientStruct{Packages: packages, Edges: validedges}, pkgmap, outErr
 }
 
 func isPrimitive(name string) bool {
@@ -211,14 +255,15 @@ func isPrimitive(name string) bool {
 			return true
 		}
 	}
-	if name == "error" || name == "byte" {
+	switch name {
+	case "error", "byte", "rune", "any", "comparable":
 		return true
 	}
 	return false
 }
 
-// This will fill in the packageName, and filename is figured out later after the whole
-// AST has been traversed. TODO clean this up to not separate those steps
+// GetType returns the name of an identifier type and, if it is not a
+// primitive, a node pointing at it (file is resolved later).
 func GetType(node *ast.Ident, packageName string) (string, *Node) {
 	var toNode *Node
 	name := node.Name
@@ -228,144 +273,187 @@ func GetType(node *ast.Ident, packageName string) (string, *Node) {
 	return name, toNode
 }
 
+// GetTypes returns every named type referenced by a type expression.
+// It never panics: unknown expression kinds simply yield no references.
 func GetTypes(node ast.Expr, packageName string) ([]string, []*Node) {
-	switch node.(type) {
+	switch t := node.(type) {
 	case *ast.Ident:
-		toNodes := []*Node{}
-		name, toNode := GetType(node.(*ast.Ident), packageName)
+		name, toNode := GetType(t, packageName)
 		if toNode != nil {
-			toNodes = append(toNodes, toNode)
+			return []string{name}, []*Node{toNode}
 		}
-		return []string{name}, toNodes
+		return []string{name}, nil
 	case *ast.SelectorExpr:
-		// TODO: This assumes the selector expression is of type Ident. Use scope.lookup instead.
-		xPackageName := node.(*ast.SelectorExpr).X.(*ast.Ident).Name
-		toNodes := []*Node{}
-		name, toNode := GetType(node.(*ast.SelectorExpr).Sel, xPackageName)
-		if toNode != nil {
-			toNodes = append(toNodes, toNode)
+		pkg, ok := t.X.(*ast.Ident)
+		if !ok {
+			return []string{t.Sel.Name}, nil
 		}
-		return []string{name}, toNodes
+		name, toNode := GetType(t.Sel, pkg.Name)
+		if toNode != nil {
+			return []string{name}, []*Node{toNode}
+		}
+		return []string{name}, nil
 	case *ast.ArrayType:
-		return GetTypes(node.(*ast.ArrayType).Elt, packageName)
-	case *ast.MapType:
-		// TODO: also handle the value
-		return GetTypes(node.(*ast.MapType).Key, packageName)
+		return GetTypes(t.Elt, packageName)
+	case *ast.Ellipsis:
+		return GetTypes(t.Elt, packageName)
 	case *ast.StarExpr:
-		return GetTypes(node.(*ast.StarExpr).X, packageName)
-	case *ast.FuncType:
-		return []string{"TODO"}, nil
-	case *ast.InterfaceType:
-		return []string{"TODO"}, nil
+		return GetTypes(t.X, packageName)
+	case *ast.ParenExpr:
+		return GetTypes(t.X, packageName)
 	case *ast.ChanType:
-		return []string{"TODO"}, nil
+		return GetTypes(t.Value, packageName)
+	case *ast.MapType:
+		return mergeTypes(packageName, t.Key, t.Value)
+	case *ast.IndexExpr: // generic instantiation: T[A]
+		return mergeTypes(packageName, t.X, t.Index)
+	case *ast.IndexListExpr: // generic instantiation: T[A, B]
+		return mergeTypes(packageName, append([]ast.Expr{t.X}, t.Indices...)...)
+	case *ast.StructType:
+		var exprs []ast.Expr
+		for _, f := range t.Fields.List {
+			exprs = append(exprs, f.Type)
+		}
+		return mergeTypes(packageName, exprs...)
+	case *ast.FuncType, *ast.InterfaceType:
+		return nil, nil
 	default:
-		fmt.Println(reflect.TypeOf(node))
-		panic("Need to cover all Type Exprs")
+		return nil, nil
 	}
 }
 
-// (path, packages) -> (Write to directory)
-// Given a client side struct data structure, deserialize it into an AST
-// and write to the given directory
-func WriteClientPackages(dirpath string, pkgs map[string]*ast.Package, clientpackages []Package) error {
-	var err error
-	for _, clientpackage := range clientpackages {
-		for _, clientfile := range clientpackage.Files {
-			packagename := clientpackage.Name
-			packageast := pkgs[packagename]
-			// Get the AST with the matching file name
-			f := packageast.Files[clientfile.Name]
+func mergeTypes(packageName string, exprs ...ast.Expr) ([]string, []*Node) {
+	var names []string
+	var nodes []*Node
+	for _, e := range exprs {
+		n, nd := GetTypes(e, packageName)
+		names = append(names, n...)
+		nodes = append(nodes, nd...)
+	}
+	return names, nodes
+}
 
-			if f == nil {
-				fmt.Println("Couldn't find", packagename, packageast.Files, clientfile.Name)
+// WriteClientPackages applies struct edits from the client to the parsed
+// packages and rewrites the affected files on disk.
+func WriteClientPackages(dirpath string, pkgs map[string]*ast.Package, clientpackages []Package) error {
+	for _, clientpackage := range clientpackages {
+		packageast, ok := pkgs[clientpackage.Name]
+		if !ok {
+			return fmt.Errorf("unknown package %q", clientpackage.Name)
+		}
+		for _, clientfile := range clientpackage.Files {
+			f, ok := packageast.Files[clientfile.Name]
+			if !ok {
+				return fmt.Errorf("unknown file %q in package %q", clientfile.Name, clientpackage.Name)
 			}
-			// Update the AST with the values from the client
-			f, err = clientFileToAST(clientfile, f)
+			newFile, err := clientFileToAST(clientfile, f)
 			if err != nil {
 				return err
 			}
-			writeFileAST(clientfile.Name, f)
+			if err := writeFileAST(clientfile.Name, newFile); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-// Write the given AST to the filepath
-func writeFileAST(filepath string, f *ast.File) {
-	fset := token.NewFileSet()
+func writeFileAST(path string, f *ast.File) error {
 	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, f); err != nil {
-		panic(err)
+	if err := format.Node(&buf, token.NewFileSet(), f); err != nil {
+		return err
 	}
-	err := ioutil.WriteFile(filepath, buf.Bytes(), 0644)
-	if err != nil {
-		panic(err)
-	}
+	return os.WriteFile(path, buf.Bytes(), 0644)
 }
 
-// ClientFileToAST convert
+// clientFileToAST replaces the struct declarations in f with the client's
+// structs. Non-struct type declarations, imports, funcs, vars and consts are
+// kept in place; the new structs go where the first struct used to be (or
+// after the imports if the file had none).
 func clientFileToAST(clientfile File, f *ast.File) (*ast.File, error) {
-	var newdecls []ast.Decl
-	if len(f.Decls) > 0 {
-		newdecls = []ast.Decl{f.Decls[0]}
-	} else {
-		newdecls = []ast.Decl{}
-	}
-
-	f.Decls = removeStructDecls(f.Decls)
 	newstructs, err := clientFileToDecls(clientfile)
 	if err != nil {
 		return nil, err
 	}
-	// Assume import is the first decl. Add typedefs after that
-	newdecls = append(newdecls, newstructs...)
-	if len(f.Decls) > 0 {
-		newdecls = append(newdecls, f.Decls[1:]...)
-	} else {
-		newdecls = append(newdecls, f.Decls...)
+
+	decls := []ast.Decl{}
+	inserted := false
+	for _, decl := range f.Decls {
+		g, ok := decl.(*ast.GenDecl)
+		if !ok || g.Tok != token.TYPE {
+			decls = append(decls, decl)
+			continue
+		}
+		kept := []ast.Spec{}
+		hadStruct := false
+		for _, s := range g.Specs {
+			if ts, ok := s.(*ast.TypeSpec); ok {
+				if _, isStruct := ts.Type.(*ast.StructType); isStruct {
+					hadStruct = true
+					continue
+				}
+			}
+			kept = append(kept, s)
+		}
+		if hadStruct && !inserted {
+			decls = append(decls, newstructs...)
+			inserted = true
+		}
+		if len(kept) > 0 {
+			g.Specs = kept
+			decls = append(decls, g)
+		}
 	}
-	f.Decls = newdecls
+
+	if !inserted {
+		// No existing structs: place new ones after the import block(s).
+		pos := 0
+		for pos < len(decls) {
+			if g, ok := decls[pos].(*ast.GenDecl); ok && g.Tok == token.IMPORT {
+				pos++
+				continue
+			}
+			break
+		}
+		rest := append([]ast.Decl{}, decls[pos:]...)
+		decls = append(append(decls[:pos], newstructs...), rest...)
+	}
+
+	f.Decls = decls
+	// Comments are position-based and would be misplaced after the rewrite.
+	f.Comments = nil
 	return f, nil
 }
 
-// Given a client-formatted File struct, return a list of AST declarations
+// clientFileToDecls builds one type declaration per client struct.
 func clientFileToDecls(clientfile File) ([]ast.Decl, error) {
 	decls := []ast.Decl{}
 	for _, clientstruct := range clientfile.Structs {
-		decl := &ast.GenDecl{Tok: token.TYPE}
+		if !token.IsIdentifier(clientstruct.Name) {
+			return nil, fmt.Errorf("invalid struct name %q", clientstruct.Name)
+		}
 		fieldList := []*ast.Field{}
 		for _, clientfield := range clientstruct.Fields {
-			// TODO assuming literal == struct. Change to support more than ident
-			// TODO tags
-			// TODO support maps
+			if !clientfield.Embedded && !token.IsIdentifier(clientfield.Name) {
+				return nil, fmt.Errorf("invalid field name %q in struct %s", clientfield.Name, clientstruct.Name)
+			}
 			parsedtype, err := parser.ParseExpr(clientfield.Type.Literal)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("invalid type %q for %s.%s: %w", clientfield.Type.Literal, clientstruct.Name, clientfield.Name, err)
 			}
-			field := ast.Field{
-				Names: []*ast.Ident{&ast.Ident{Name: clientfield.Name}},
-				Type:  parsedtype}
-			fieldList = append(fieldList, &field)
+			field := &ast.Field{Type: parsedtype}
+			if !clientfield.Embedded {
+				field.Names = []*ast.Ident{ast.NewIdent(clientfield.Name)}
+			}
+			fieldList = append(fieldList, field)
 		}
-		fields := &ast.FieldList{List: fieldList}
-		structExpr := &ast.StructType{Struct: token.NoPos, Fields: fields}
-		spec := ast.TypeSpec{
-			Name: ast.NewIdent(clientstruct.Name),
-			Type: structExpr}
-		decl.Specs = append(decl.Specs, &spec)
-		decls = append(decls, decl)
+		decls = append(decls, &ast.GenDecl{
+			Tok: token.TYPE,
+			Specs: []ast.Spec{&ast.TypeSpec{
+				Name: ast.NewIdent(clientstruct.Name),
+				Type: &ast.StructType{Fields: &ast.FieldList{List: fieldList}},
+			}},
+		})
 	}
 	return decls, nil
-}
-
-func removeStructDecls(decls []ast.Decl) []ast.Decl {
-	// TODO type definitions that aren't structs
-	newdecls := []ast.Decl{}
-	for _, decl := range decls {
-		if g, ok := decl.(*ast.GenDecl); !ok || g.Tok != token.TYPE {
-			newdecls = append(newdecls, decl)
-		}
-	}
-	return newdecls
 }
