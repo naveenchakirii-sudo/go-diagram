@@ -1,35 +1,70 @@
 # go-diagram
 
-A UML diagram editor for Golang projects.
+A UML diagram editor for Go projects. Point it at a directory and it shows every struct, its fields, and the references between structs as a live diagram in your browser. Edits in the diagram (rename a struct or field, change a type, add or remove fields) are written back to your `.go` files, and changes to the files show up in the diagram within a couple of seconds.
 
-> **Maintainence warning**: This project is not maintained as this was a college project. Pull requests are accepted though.
+> **Fork notice:** go-diagram was created by **Grant Timmerman and Anwell Wang** ([grant/go-diagram](https://github.com/grant/go-diagram)) as a 2016 college project. This fork modernizes the toolchain, fixes data-loss bugs in the write-back path, and adds tests, Docker, and CI. See [CHANGES.md](CHANGES.md) for what changed.
 
-## Links
-[Project Proposal (includes response to feedback, reference, and design document)](https://docs.google.com/document/d/1exvOxiBwERKd5P1nZ7hjmhkGchoAhr0tZK_f_3EVy2M/edit)
+![overview](docs/overview.png)
 
-[Poster](https://docs.google.com/presentation/d/1xgy8ltVHn0e96vcdWVlRIYVDdQI2QKU-5a366ivnRjo/edit)
+## Quick start
 
-## [Video Demo](https://drive.google.com/file/d/0B4riRkl944ZqcnQzR0x1c0QxVDA/view?usp=sharing)
-[![screenshot from 2016-03-17 02 05 31](https://cloud.githubusercontent.com/assets/2159661/13841247/f70780fa-ebe4-11e5-96ba-5667c4af1b12.png)](https://drive.google.com/file/d/0B4riRkl944ZqcnQzR0x1c0QxVDA/view?usp=sharing)
+Requires Go 1.24+ and Node 20+.
 
-## Setup
-Make sure your `PATH` includes `:$GOPATH/bin`
-```
-cd app
-sudo npm i
-npm run build
+```sh
+# build the frontend
+cd app && npm ci && npm run build && cd ..
 
-cd ..
-go install github.com/grant/go-diagram
-go-diagram <directory name>
+# run against any Go project
+go run . /path/to/your/go/project
 ```
 
-## Tech Stack
-- Golang for the server (uses goparser, gorilla websockets)
-- React + Redux frontend
-  - Webpack
-  - Babel
-  - Stylus
+The server listens on `http://127.0.0.1:8080` and opens your browser.
 
-## Other
-I believe Go 1.5+ is required.
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `-addr` | `127.0.0.1:8080` | Listen address. Localhost only by default, since the server writes files. |
+| `-static` | `./app/dist` | Directory with the built frontend. |
+| `-read-only` | `false` | Show the diagram but reject edits. |
+| `-no-browser` | `false` | Don't open a browser on start. |
+
+### Docker
+
+```sh
+docker build -t go-diagram .
+docker run --rm -p 8080:8080 -v "$PWD":/project go-diagram
+```
+
+## Using the diagram
+
+- **Pan:** drag the background or scroll. **Zoom:** ctrl/⌘ + scroll, or the buttons at the bottom right.
+- **Edit:** click a struct name, field name, or type, type the new value, then press Enter (Esc cancels).
+- **Add or remove:** `+` on a file adds a struct, `c` on a struct adds a field, `f` removes a field, `x` deletes a struct.
+- **Invalid edits** (for example, a type that doesn't parse) are rejected. The file is left untouched, and the diagram reverts.
+
+Struct tags, generic type parameters, embedded fields, imports, functions, and non-struct type declarations are preserved when a file is rewritten. Comments inside rewritten files are not preserved yet.
+
+## Development
+
+```sh
+go run . -no-browser -addr 127.0.0.1:8080 ./example1   # backend
+cd app && npm run dev                                   # frontend with hot reload (proxies /ws)
+```
+
+Tests:
+
+```sh
+go test -race ./...
+cd app && npm test
+```
+
+## Architecture
+
+- **`parse/`** walks the project with `go/parser`, turns struct declarations into JSON (packages → files → structs → fields), and records an edge for every field whose type refers to another struct in the project (including through pointers, slices, maps, channels, and generic instantiations). `WriteClientPackages` rebuilds only the struct declarations from edited JSON and re-prints the file with `go/format`.
+- **`server.go`** serves the frontend and a websocket at `/ws`. Each connection polls a fingerprint of the project's `.go` files and pushes a fresh diagram when anything changes. Edits from the browser are validated and written under a mutex, and errors go back to the client.
+- **`app/`** is React 19 + Redux Toolkit, built with Vite. A middleware owns the websocket, reconnects with backoff, and sends the updated package data after each edit. Edges are drawn as SVG curves measured from the rendered field rows.
+
+## License
+
+The original repository does not include a top-level license file (the frontend's `package.json` declares MIT). Changes in this fork are offered under the same terms as the original project.

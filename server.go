@@ -237,7 +237,7 @@ func main() {
 		log.Fatalf("%s is not a directory", dir)
 	}
 	if _, err := os.Stat(filepath.Join(*staticDir, "index.html")); err != nil {
-		log.Fatalf("frontend not found in %s; run `npm run build` in app/ or pass -static", *staticDir)
+		log.Printf("warning: frontend not found in %s; run `npm run build` in app/, pass -static, or use `npm run dev`", *staticDir)
 	}
 
 	proj := &project{dir: dir}

@@ -53,3 +53,37 @@ func TestWebsocketPushesDiagramAndSavesEdits(t *testing.T) {
 	b, _ := os.ReadFile(file)
 	t.Fatalf("edit was not written to disk:\n%s", b)
 }
+
+func TestReadOnlyRejectsEdits(t *testing.T) {
+	*readOnly = true
+	defer func() { *readOnly = false }()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "demo.go")
+	src := "package demo\n\ntype Node struct {\n\tValue int\n}\n"
+	os.WriteFile(file, []byte(src), 0o644)
+
+	srv := httptest.NewServer(wsHandler(&project{dir: dir}))
+	defer srv.Close()
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var cs parse.ClientStruct
+	if err := ws.ReadJSON(&cs); err != nil {
+		t.Fatal(err)
+	}
+	cs.Packages[0].Files[0].Structs[0].Name = "Vertex"
+	ws.WriteJSON(cs)
+	var msg map[string]any
+	if err := ws.ReadJSON(&msg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg["error"]; !ok {
+		t.Fatalf("expected an error message, got %v", msg)
+	}
+	if b, _ := os.ReadFile(file); string(b) != src {
+		t.Fatalf("file changed in read-only mode:\n%s", b)
+	}
+}
